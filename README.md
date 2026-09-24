@@ -11,7 +11,8 @@
 - 支持可选**内容标签最低配额** `tag_minimums`：按 `content_tag` 声明本场至少要答的题数；剩余答题位仅够补缺口时只从欠额标签选题，欠额标签题量不足时以明确的 `finish_reason` 结束且不额外计曝光；
 - 支持可选**能力估计精度停测** `target_se` + `min_precision_items`：每次作答更新 θ 后，在当前 θ 处重算本场全部已答题的 2PL Fisher 信息总和，`SE = 1/√Σ信息`；已答数达到下限、`SE ≤ target_se` 且标签配额均已满足时，在同一事务内结束会话（`finish_reason = precision_reached`）；
 - 提供会话进度查询与完整答题记录查询，会话状态/进度/取题响应均返回当前标准误 `standard_error` 与停测配置；
-- 支持**题库批量导入与预检** `POST /api/items/import`：一次提交题目数组与 `dry_run`，逐行校验 ID、选项键、答案、难度/区分度、`content_tag` 与批内重复 ID；预检只报告 `created`/`updated` 计划不写库，正式提交在单个 `BEGIN IMMEDIATE` 事务内原子新增或更新（更新保留 `exposure_count`），任一错误整批不变；
+- 支持**题库批量导入与预检** `POST /api/items/import`：一次提交题目数组与 `dry_run`，逐行校验 ID、选项键、答案、难度/区分度、`content_tag` 与批内重复 ID；预检只报告 `created`/`updated` 计划不写库，正式提交在单个 `BEGIN IMMEDIATE` 事务内原子新增或更新（更新保留 `exposure_count` 与启用状态），任一错误整批不变；
+- 支持**题目撤回 / 启用** `PATCH /api/items/{id}/availability`：撤回题不再参与新取题；会话挂起题被撤回时，再次取题在同一事务内清除挂起项并按现有规则重选（原曝光计数不回退）；对已撤回题提交新作答返回 `409`（不写答题记录、不更新能力），已保存 `response_id` 重放仍返回首次结果；题库列表/详情返回 `is_active`，旧库启动时自动迁移为全部启用；
 - 提供**单题质量复盘** `GET /api/items/{id}/analysis`：只统计**已结束会话**的历史作答，并使用作答时冻结保存的 `score`（之后修改题目答案不影响复盘结果）；对每个答过目标题且同场至少另答一题的会话，以「目标题得分 + 同场其余题答对比例」组成样本，返回有效样本数、历史正确率及两者的 Pearson 相关系数（样本少于 5 或任一序列无方差时为 `null`；未知题目 `404`；接口只读）；
 - 自带 30 题确定性演示题库，容器启动后即可调用。
 
@@ -76,7 +77,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 python examples/demo.py
 ```
 
-脚本会：创建带 600 秒时限的会话（演示 `duration_seconds` 越界校验与 `expires_at`）→ 循环「取题 → 作答」5 轮 → 演示重复 `response_id` 幂等、重复 `/next` 不重复计曝光 → 打印进度与答题记录 → 演示 `tag_minimums` 配额选题（含配额校验、末段只从欠额标签选题、无法补齐时 `tag_minimums_unfulfillable` 结束且不增加曝光）→ 演示精度停测（参数校验、SE 逐题下降、`precision_reached` 触发与重复 `response_id` 不重复触发状态变化）→ 演示**暂停 / 恢复**（冻结 `remaining_seconds`、暂停期间取题/新作答/重复暂停返回 409、恢复后重算 `expires_at` 且挂起题与曝光原样保留、无时限会话暂停/恢复、已结束会话 409）。
+脚本会：创建带 600 秒时限的会话（演示 `duration_seconds` 越界校验与 `expires_at`）→ 循环「取题 → 作答」5 轮 → 演示重复 `response_id` 幂等、重复 `/next` 不重复计曝光 → 打印进度与答题记录 → 演示 `tag_minimums` 配额选题（含配额校验、末段只从欠额标签选题、无法补齐时 `tag_minimums_unfulfillable` 结束且不增加曝光）→ 演示精度停测（参数校验、SE 逐题下降、`precision_reached` 触发与重复 `response_id` 不重复触发状态变化）→ 演示**暂停 / 恢复**（冻结 `remaining_seconds`、暂停期间取题/新作答/重复暂停返回 409、恢复后重算 `expires_at` 且挂起题与曝光原样保留、无时限会话暂停/恢复、已结束会话 409）→ 演示**题目撤回 / 启用**（未知题目 404、撤回挂起题后 `/next` 同事务重选且曝光不回退、新作答 409、`response_id` 重放仍返回首次结果、导入保留撤回状态，结尾恢复启用）。
 
 ## 核心算法
 
@@ -105,14 +106,17 @@ h  = -a²·P·(1-P) = -I(θ)
 
 候选题必须同时满足：
 
-1. `exposure_count < exposure_limit`（**全局**曝光上限，所有会话共享）；
-2. 该题在本会话中尚未作答（不重复出题）。
+1. `is_active = true`（题目未被撤回，见「题目撤回与启用」一节）；
+2. `exposure_count < exposure_limit`（**全局**曝光上限，所有会话共享）；
+3. 该题在本会话中尚未作答（不重复出题）。
 
 候选题按 `(-信息量, 题目 ID)` 排序取第一题 —— 信息量最大优先，**完全并列时
 ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的同一事务内
 `exposure_count += 1`。
 
 - 若存在「已取出但未作答」的挂起题，重复调 `/next` 返回**同一题且不重复加曝光**；
+  但若挂起题已被撤回，则在该次 `/next` 的**同一事务内**清除挂起项并按上述规则重选
+  （被撤回题已计的曝光**不回退**）；
 - 已答满 `max_items` → 会话结束，`finish_reason = max_items`；
 - 没有满足曝光上限的候选题 → 结束，`finish_reason = no_available_items`；
 - 设置了标签配额且欠额标签已无法补齐 → 结束，
@@ -252,7 +256,8 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
   - 全部行合法时，在**单个 `BEGIN IMMEDIATE` 事务**内以
     `INSERT ... ON CONFLICT(id) DO UPDATE` 批量 upsert：新 ID 新增、旧 ID 就地更新；
   - 更新覆盖 `difficulty` / `discrimination` / `content_tag` / `stem` / `options` / `answer`，
-    **保留 `exposure_count`**——重新导入题库不会把全局曝光计数清零，已被会话引用的题目照常可用；
+    **保留 `exposure_count` 与 `is_active`**——重新导入题库不会把全局曝光计数清零，
+    也不会改变题目的撤回/启用状态，已被会话引用的题目照常可用；新导入的题默认启用；
   - **任一错误整批不变**：只要有一行校验失败即不写任何数据，返回 HTTP `422`
     （`valid=false`、两个计数均为 0、`results` 为空、`errors` 列出全部问题）；
     事务内的数据库异常同样整体回滚。
@@ -272,6 +277,39 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
 
   有错误的正式提交返回 HTTP `422` 且 `valid=false`、计数为 0；
   预检即使有错误也是 HTTP `200`，便于把预检集成进上传 UI。
+
+### 题目撤回与启用（`PATCH /api/items/{item_id}/availability`）
+
+每道题都有启用状态 `is_active`（题库列表 `GET /api/items` 与详情
+`GET /api/items/{id}` 均返回该字段）。请求体只有一个严格布尔字段：
+
+```bash
+# 撤回：不再参与新取题
+curl -s -X PATCH http://localhost:8000/api/items/ITEM-001/availability \
+  -H 'Content-Type: application/json' \
+  -d '{"is_active": false}'
+# 重新启用：立即恢复参与选题
+curl -s -X PATCH http://localhost:8000/api/items/ITEM-001/availability \
+  -H 'Content-Type: application/json' \
+  -d '{"is_active": true}'
+```
+
+- 未知题目返回 **404**；`is_active` 非布尔（如 `"false"`、`0`）返回 **422**；
+  重复设置同一状态是幂等 no-op，响应始终为该题当前详情（含 `is_active`）。
+- **撤回题不再参与新取题**：`/next` 候选池在「未作答 + 曝光上限」之外再排除
+  `is_active = false` 的题（标签配额场景同样生效，可能导致
+  `tag_minimums_unfulfillable`）。
+- **挂起题被撤回**：会话当前待答题在取出后被撤回的，再次调用 `/next` 会在
+  **同一事务内**清除挂起项并按现有选题规则重选一题（新题正常计一次曝光）；
+  被撤回题**已计的曝光不回退**。
+- **已撤回题的新作答返回 409**：不写答题记录、不更新能力值；但已保存的
+  `response_id` **重放仍返回首次结果**（HTTP 200，幂等优先于撤回检查）。
+- **历史数据不受影响**：已写入的答题记录、θ 轨迹、曝光计数与单题复盘保持原样；
+  重新启用后该题立即恢复参与选题（曝光计数不变）。
+- **批量导入**：更新既有题目时**保留**其启用状态（导入体不含该字段）；
+  新题导入**默认启用**。
+- **旧库迁移**：服务启动时自动为 `items` 表添加 `is_active` 列，既有题目
+  **全部置为启用**，无需手工迁移。
 
 ### 单题质量复盘（`GET /api/items/{id}/analysis`）
 
@@ -310,10 +348,11 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET  | `/health` | 健康检查、题库题量 |
-| GET  | `/api/items` | 题库列表（含曝光次数，分页 `limit/offset`） |
-| GET  | `/api/items/{item_id}` | 单题详情（管理用，含正确答案） |
+| GET  | `/api/items` | 题库列表（含曝光次数与启用状态，分页 `limit/offset`） |
+| GET  | `/api/items/{item_id}` | 单题详情（管理用，含正确答案与启用状态） |
+| PATCH | `/api/items/{item_id}/availability` | **题目撤回/启用**（`is_active`；撤回题不参与新取题，新作答 409，未知题目 404） |
 | GET  | `/api/items/{item_id}/analysis` | **单题质量复盘**（已结束会话样本、历史正确率、与同场表现的 Pearson 相关系数；只读） |
-| POST | `/api/items/import` | **题库批量导入/预检**（逐行错误、dry_run、事务原子 upsert、更新保留曝光数） |
+| POST | `/api/items/import` | **题库批量导入/预检**（逐行错误、dry_run、事务原子 upsert、更新保留曝光数与启用状态） |
 | POST | `/api/sessions` | 创建测验会话 |
 | GET  | `/api/sessions/{id}` | 会话状态 |
 | GET  | `/api/sessions/{id}/progress` | **会话进度**（θ、已答数、挂起题、已答题目、暂停状态与剩余秒数） |
@@ -374,11 +413,23 @@ curl -s -X POST http://localhost:8000/api/items/import \
 #  ]}
 
 # 预检通过后正式提交（去掉 dry_run 或置 false）：单事务原子 upsert，
-# 任一错误整批不变（HTTP 422，题库保持原样）；更新既有题目保留 exposure_count
+# 任一错误整批不变（HTTP 422，题库保持原样）；更新既有题目保留 exposure_count 与 is_active
 curl -s -X POST http://localhost:8000/api/items/import \
   -H 'Content-Type: application/json' \
   -d '{"items":[ ...同上... ]}'
 # {"dry_run":false,"valid":true,"created_count":1,"updated_count":1, ...}
+
+# 1c) 题目撤回 / 启用（未知题目返回 404；题库列表与详情均返回 is_active）
+curl -s -X PATCH http://localhost:8000/api/items/ITEM-001/availability \
+  -H 'Content-Type: application/json' \
+  -d '{"is_active": false}'
+# {"id":"ITEM-001", ..., "is_active":false, "exposure_count":3, ...}
+# 撤回后：/next 不会再选该题；若它是某会话的挂起题，下次 /next 在同一事务内
+# 清除挂起项并重选（曝光不回退）；对该题提交新作答返回 409，
+# 已保存的 response_id 重放仍返回首次结果
+curl -s -X PATCH http://localhost:8000/api/items/ITEM-001/availability \
+  -H 'Content-Type: application/json' \
+  -d '{"is_active": true}'     # 重新启用
 
 # 2) 创建会话（初始 θ=0，最多 10 题，单题曝光上限 5）
 curl -s -X POST http://localhost:8000/api/sessions \
@@ -487,4 +538,5 @@ curl -s http://localhost:8000/api/items/ITEM-001/analysis
 - 模型为 2PL（无猜测参数）；演示题为简单算术题，重点展示选题与能力更新机制。
 - 曝光计数是**跨会话全局**的：用于模拟真实 CAT 的曝光控制（曝光上限可按会话放宽/收紧）。
 - 暂停/恢复**无需额外配置**：状态与冻结秒数随会话存放在同一 SQLite 库；服务启动时旧库自动迁移（新增 `paused_at` / `remaining_seconds` 列，并把 `status` 的 CHECK 放宽到 `active/paused/finished`），历史会话与答题记录原样保留。所有时间戳均为 **UTC**、秒级精度，因此暂停冻结与恢复重算的截止时间最多有 ±1 秒的取整误差。
+- 题目撤回状态 `is_active` 随题库存放在同一 SQLite 库；旧库启动时自动迁移（`items` 表新增 `is_active` 列，**既有题目全部置为启用**），历史曝光计数与答题记录不受影响。
 - SQLite + WAL 适合单机/演示与中小流量；写事务已串行化（暂停/恢复同样使用 `BEGIN IMMEDIATE`），水平扩展时可替换连接层。

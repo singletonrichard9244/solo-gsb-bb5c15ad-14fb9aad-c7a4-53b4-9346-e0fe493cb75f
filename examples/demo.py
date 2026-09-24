@@ -14,6 +14,11 @@ the optional precision stop rule (``target_se`` /
 ``min_precision_items``, ``finish_reason = precision_reached``), and
 finally pause/resume (frozen remaining time, 409 while paused, pending
 item and exposures preserved after resume, unlimited-time sessions).
+The last section demonstrates item withdrawal
+(``PATCH /api/items/{id}/availability``): a withdrawn pending item is
+cleared and re-selected by /next without rolling back its exposure, new
+answers to a withdrawn item are rejected with 409, saved ``response_id``
+replays still return the first result, and imports preserve the flag.
 """
 
 from __future__ import annotations
@@ -179,6 +184,7 @@ def main() -> None:
     demo_tag_minimums()
     demo_precision_stop()
     demo_pause_resume()
+    demo_withdrawal()
 
 
 def demo_pause_resume() -> None:
@@ -475,6 +481,99 @@ def demo_tag_minimums() -> None:
     assert done["finish_reason"] == "tag_minimums_unfulfillable"
     assert done["item"] is None, "结束时不额外选题/曝光"
     print("  -> 欠额标签题数不足时以 tag_minimums_unfulfillable 结束，未增加曝光 ✔")
+
+
+def demo_withdrawal() -> None:
+    """Show item withdrawal: PATCH availability, pending re-select, 409s."""
+    print("\n=== 题目撤回 / 启用 ===")
+    session = call(
+        "POST", "/api/sessions",
+        {"max_items": 5, "exposure_limit": 10_000},
+    )
+    sid = session["id"]
+    chosen = call("POST", f"/api/sessions/{sid}/next")
+    item = chosen["item"]
+    iid = item["id"]
+    print(f"  -> 会话取到挂起题 {iid}（本次曝光计为 {chosen['exposure_count']}）")
+
+    # 未知题目 -> 404。
+    expect_http_error(
+        "PATCH", "/api/items/NO-SUCH-ITEM/availability", {"is_active": False},
+    )
+
+    # 撤回挂起题；题库详情与列表都返回 is_active=false。
+    withdrawn = call("PATCH", f"/api/items/{iid}/availability", {"is_active": False})
+    show(f"PATCH /api/items/{iid}/availability（撤回）", {
+        "id": withdrawn["id"],
+        "is_active": withdrawn["is_active"],
+        "exposure_count": withdrawn["exposure_count"],
+    })
+    assert withdrawn["is_active"] is False
+    assert call("GET", f"/api/items/{iid}")["is_active"] is False
+    listed = call("GET", "/api/items?limit=100")["items"]
+    assert next(r for r in listed if r["id"] == iid)["is_active"] is False
+    print("  -> 题库详情与列表均返回 is_active=false ✔")
+
+    # 对已撤回题提交新作答 -> 409；不写答题记录、不更新能力。
+    expect_http_error(
+        "POST", f"/api/sessions/{sid}/responses",
+        {"response_id": f"demo-wd-{sid[:8]}", "item_id": iid, "response": "A"},
+    )
+    progress = call("GET", f"/api/sessions/{sid}/progress")
+    assert progress["answered_count"] == 0
+    assert progress["theta"] == session["theta"]
+    print("  -> 对已撤回题提交新作答返回 409，未写答题记录、未更新能力 ✔")
+
+    # 再次 /next：同一事务内清除挂起项并按现有规则重选；原曝光计数不回退。
+    reselected = call("POST", f"/api/sessions/{sid}/next")
+    new_item = reselected["item"]
+    assert new_item is not None and new_item["id"] != iid
+    assert call("GET", f"/api/items/{iid}")["exposure_count"] == \
+        chosen["exposure_count"], "被撤回题的曝光计数不应回退"
+    print(f"  -> 再次 /next 重选为 {new_item['id']}，被撤回题曝光未回退 ✔")
+
+    # 作答新题后撤回它：已保存 response_id 的重放仍返回首次结果。
+    new_detail = call("GET", f"/api/items/{new_item['id']}")
+    resp_id = f"demo-wd-ok-{sid[:8]}"
+    saved = call(
+        "POST", f"/api/sessions/{sid}/responses",
+        {"response_id": resp_id, "item_id": new_item["id"],
+         "response": new_detail["answer"]},
+    )
+    call("PATCH", f"/api/items/{new_item['id']}/availability", {"is_active": False})
+    replay = call(
+        "POST", f"/api/sessions/{sid}/responses",
+        {"response_id": resp_id, "item_id": new_item["id"],
+         "response": new_detail["answer"]},
+    )
+    assert replay["created_at"] == saved["created_at"]
+    assert replay["theta_after"] == saved["theta_after"]
+    print("  -> 题目撤回后，已保存 response_id 重放仍返回首次结果 ✔")
+
+    # 批量导入更新旧题时保留撤回状态。
+    d1 = call("GET", f"/api/items/{iid}")
+    call(
+        "POST", "/api/items/import",
+        {"items": [{
+            "id": iid,
+            "difficulty": d1["difficulty"],
+            "discrimination": d1["discrimination"],
+            "content_tag": d1["content_tag"],
+            "stem": d1["stem"],
+            "options": d1["options"],
+            "answer": d1["answer"],
+        }]},
+    )
+    assert call("GET", f"/api/items/{iid}")["is_active"] is False
+    print("  -> 批量导入更新旧题保留撤回状态（新题默认启用）✔")
+
+    # 恢复启用，题库回到演示前状态。
+    for wid in (iid, new_item["id"]):
+        restored = call(
+            "PATCH", f"/api/items/{wid}/availability", {"is_active": True},
+        )
+        assert restored["is_active"] is True
+    print("  -> 两题已恢复启用（is_active=true），题库状态还原 ✔")
 
 
 if __name__ == "__main__":

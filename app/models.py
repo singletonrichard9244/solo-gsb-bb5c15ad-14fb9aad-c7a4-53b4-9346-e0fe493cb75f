@@ -41,10 +41,24 @@ class BankItemOut(BaseModel):
     stem: str
     answer: str
     exposure_count: int
+    is_active: bool
 
 
 class ItemDetailOut(BankItemOut):
     options: list[OptionOut]
+
+
+class ItemAvailabilityUpdate(BaseModel):
+    """PATCH body: withdraw (false) or re-enable (true) one bank item."""
+
+    is_active: bool = Field(
+        ...,
+        strict=True,
+        description=(
+            "启用状态：true=启用（参与新取题）；"
+            "false=撤回（不再参与新取题，对该题的新作答返回 409）"
+        ),
+    )
 
 
 class ItemBankOut(BaseModel):

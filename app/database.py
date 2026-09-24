@@ -48,7 +48,9 @@ CREATE TABLE IF NOT EXISTS items (
     stem           TEXT NOT NULL,
     options        TEXT NOT NULL, -- JSON: [{"key": "A", "text": "..."}]
     answer         TEXT NOT NULL, -- correct option key, e.g. "B"
-    exposure_count INTEGER NOT NULL DEFAULT 0
+    exposure_count INTEGER NOT NULL DEFAULT 0,
+    -- 1 = enabled (selectable); 0 = withdrawn (no new selections/answers).
+    is_active      INTEGER NOT NULL DEFAULT 1
 );
 
 """ + SCHEMA_SESSIONS + """
@@ -192,6 +194,15 @@ def init_db() -> None:
             _ensure_column(conn, "sessions", "expires_at", "TEXT")
             _ensure_column(conn, "sessions", "target_se", "REAL")
             _ensure_column(conn, "sessions", "min_precision_items", "INTEGER")
+
+        # The availability flag migrates legacy item banks to all-enabled:
+        # ADD COLUMN backfills every existing row with the DEFAULT (1).
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='items'"
+        ).fetchone() is not None:
+            _ensure_column(
+                conn, "items", "is_active", "INTEGER NOT NULL DEFAULT 1"
+            )
 
         # Rebuild the sessions table on legacy databases (widening the status
         # CHECK requires it); executescript below then only creates the
