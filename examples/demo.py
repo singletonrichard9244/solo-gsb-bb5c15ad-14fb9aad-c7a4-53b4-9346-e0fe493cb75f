@@ -14,6 +14,11 @@ the optional precision stop rule (``target_se`` /
 ``min_precision_items``, ``finish_reason = precision_reached``), and
 finally pause/resume (frozen remaining time, 409 while paused, pending
 item and exposures preserved after resume, unlimited-time sessions).
+The last section demonstrates item withdrawal
+(``PATCH /api/items/{id}/availability``): withdrawn items leave new
+selections, a withdrawn pending item is cleared and re-selected by /next
+without rolling back its exposure, new answers for it are rejected with
+409 while a stored ``response_id`` replay still returns the first result.
 """
 
 from __future__ import annotations
@@ -179,6 +184,7 @@ def main() -> None:
     demo_tag_minimums()
     demo_precision_stop()
     demo_pause_resume()
+    demo_withdrawal()
 
 
 def demo_pause_resume() -> None:
@@ -475,6 +481,103 @@ def demo_tag_minimums() -> None:
     assert done["finish_reason"] == "tag_minimums_unfulfillable"
     assert done["item"] is None, "结束时不额外选题/曝光"
     print("  -> 欠额标签题数不足时以 tag_minimums_unfulfillable 结束，未增加曝光 ✔")
+
+
+def demo_withdrawal() -> None:
+    """Show item withdrawal: PATCH availability, pending re-select, 409."""
+    # 三道专用演示题：区分度远高于演示题库（a<=1.8），在 theta=0 的新会话里
+    # 必然按 DEMO-WD-1 -> DEMO-WD-2 -> DEMO-WD-3 的顺序被选中，结果确定。
+    # 导入为幂等 upsert：重复运行只更新题干参数，保留曝光数与启用状态。
+    def wd_item(iid: str, discrimination: float) -> dict:
+        return {
+            "id": iid, "difficulty": 0.0, "discrimination": discrimination,
+            "content_tag": "撤回演示", "stem": f"撤回演示题 {iid}：1 + 1 = ?",
+            "options": [{"key": "A", "text": "2"}, {"key": "B", "text": "3"}],
+            "answer": "A",
+        }
+
+    imported = call(
+        "POST", "/api/items/import",
+        {"items": [wd_item("DEMO-WD-1", 5.0), wd_item("DEMO-WD-2", 4.9),
+                   wd_item("DEMO-WD-3", 4.8)]},
+    )
+    assert imported["valid"] is True
+    # 重复运行时上一轮可能把演示题留在了撤回状态：先统一启用（演示启用路径）。
+    for iid in ("DEMO-WD-1", "DEMO-WD-2", "DEMO-WD-3"):
+        enabled = call("PATCH", f"/api/items/{iid}/availability",
+                       {"is_active": True})
+        assert enabled["is_active"] is True
+    print("  -> 导入 3 道演示题并全部启用（重复导入保留启用状态与曝光数）✔")
+
+    # 未知题目 PATCH -> 404
+    expect_http_error(
+        "PATCH", "/api/items/NO-SUCH-ITEM/availability", {"is_active": False},
+    )
+
+    # --- 已作答题目被撤回：已保存的 response_id 重放仍返回首次结果 ---
+    sa = call("POST", "/api/sessions",
+              {"max_items": 5, "exposure_limit": 10_000})
+    sida = sa["id"]
+    first = call("POST", f"/api/sessions/{sida}/next")
+    assert first["item"]["id"] == "DEMO-WD-1"
+    ans = call(
+        "POST", f"/api/sessions/{sida}/responses",
+        {"response_id": f"demo-wd-{sida[:8]}-1",
+         "item_id": "DEMO-WD-1", "response": "A"},
+    )
+    withdrawn = call("PATCH", "/api/items/DEMO-WD-1/availability",
+                     {"is_active": False})
+    assert withdrawn["is_active"] is False
+    replay = call(
+        "POST", f"/api/sessions/{sida}/responses",
+        {"response_id": f"demo-wd-{sida[:8]}-1",
+         "item_id": "DEMO-WD-1", "response": "A"},
+    )
+    assert replay["created_at"] == ans["created_at"]
+    assert replay["theta_after"] == ans["theta_after"]
+    print("  -> 作答后撤回题目：已保存 response_id 重放仍返回首次结果（200）✔")
+
+    # --- 挂起题被撤回：新作答 409；/next 同事务清除挂起项并重选，曝光不回退 ---
+    sb = call("POST", "/api/sessions",
+              {"max_items": 5, "exposure_limit": 10_000})
+    sidb = sb["id"]
+    pending = call("POST", f"/api/sessions/{sidb}/next")
+    assert pending["item"]["id"] == "DEMO-WD-2"
+    exposure_at_select = pending["exposure_count"]
+    call("PATCH", "/api/items/DEMO-WD-2/availability", {"is_active": False})
+
+    # 对已撤回题提交新作答 -> 409，不写答题记录、不更新能力
+    expect_http_error(
+        "POST", f"/api/sessions/{sidb}/responses",
+        {"response_id": f"demo-wd-{sidb[:8]}-new",
+         "item_id": "DEMO-WD-2", "response": "A"},
+    )
+    history = call("GET", f"/api/sessions/{sidb}/responses")
+    assert history["count"] == 0, "撤回题的新作答不能写入答题记录"
+    assert call("GET", f"/api/sessions/{sidb}")["theta"] == 0.0, "能力值不应更新"
+    print("  -> 对撤回题提交新作答返回 409，未写答题记录、能力值不变 ✔")
+
+    reselected = call("POST", f"/api/sessions/{sidb}/next")
+    show("挂起题撤回后再次 /next（同事务清除挂起项并重选）", {
+        "item": reselected["item"]["id"],
+        "note": reselected["note"],
+    })
+    assert reselected["item"]["id"] == "DEMO-WD-3"
+    assert "DEMO-WD-2" in (reselected["note"] or "")
+    after = call("GET", "/api/items/DEMO-WD-2")
+    assert after["exposure_count"] == exposure_at_select, \
+        "撤回题已计曝光不应回退"
+    print(f"  -> 重选出 DEMO-WD-3；DEMO-WD-2 曝光保持 {exposure_at_select} 不回退 ✔")
+
+    # 收尾：把演示题留在撤回状态，保证重复运行本脚本时其他演示段落不受影响。
+    for iid in ("DEMO-WD-1", "DEMO-WD-2", "DEMO-WD-3"):
+        call("PATCH", f"/api/items/{iid}/availability", {"is_active": False})
+    bank = call("GET", "/api/items?limit=100")
+    demo_rows = {i["id"]: i["is_active"] for i in bank["items"]
+                 if i["id"].startswith("DEMO-WD-")}
+    show("题库列表返回启用状态（演示题已重新撤回）", demo_rows)
+    assert all(v is False for v in demo_rows.values())
+    print("  -> 题库列表/详情均返回 is_active；演示题已撤回，不影响后续演示 ✔")
 
 
 if __name__ == "__main__":

@@ -48,7 +48,11 @@ CREATE TABLE IF NOT EXISTS items (
     stem           TEXT NOT NULL,
     options        TEXT NOT NULL, -- JSON: [{"key": "A", "text": "..."}]
     answer         TEXT NOT NULL, -- correct option key, e.g. "B"
-    exposure_count INTEGER NOT NULL DEFAULT 0
+    exposure_count INTEGER NOT NULL DEFAULT 0,
+    -- Item withdrawal: 1 = enabled (eligible for new selections), 0 = withdrawn.
+    -- Legacy databases acquire the column via ALTER TABLE ... DEFAULT 1, so
+    -- every pre-existing item migrates to "enabled".
+    is_active      INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1))
 );
 
 """ + SCHEMA_SESSIONS + """
@@ -192,6 +196,15 @@ def init_db() -> None:
             _ensure_column(conn, "sessions", "expires_at", "TEXT")
             _ensure_column(conn, "sessions", "target_se", "REAL")
             _ensure_column(conn, "sessions", "min_precision_items", "INTEGER")
+
+        # Item withdrawal: a legacy item bank acquires the is_active column
+        # with DEFAULT 1, i.e. every existing item migrates to "enabled".
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='items'"
+        ).fetchone() is not None:
+            _ensure_column(
+                conn, "items", "is_active", "INTEGER NOT NULL DEFAULT 1"
+            )
 
         # Rebuild the sessions table on legacy databases (widening the status
         # CHECK requires it); executescript below then only creates the

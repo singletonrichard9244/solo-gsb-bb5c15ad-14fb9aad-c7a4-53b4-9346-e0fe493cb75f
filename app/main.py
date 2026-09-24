@@ -19,7 +19,15 @@ exposures; time-limit-free sessions can be paused and resumed as well.
 ``POST /api/items/import`` bulk-loads the item bank with per-row
 validation: a dry run only reports the planned created/updated rows, while
 a real commit upserts every row in one serialised transaction (updates
-keep ``exposure_count``) and leaves the bank untouched if any row fails.
+keep ``exposure_count`` and ``is_active``) and leaves the bank untouched
+if any row fails.
+
+``PATCH /api/items/{id}/availability`` withdraws or re-enables one item.
+A withdrawn item no longer takes part in new selections; a session whose
+pending item was withdrawn clears it and re-selects inside the /next
+transaction (the exposure already counted is not rolled back), and new
+answers for it are rejected with 409 while a stored ``response_id``
+replay still returns the first result.
 
 Mutating endpoints use ``BEGIN IMMEDIATE`` so concurrent requests on the same
 SQLite database are serialised; exposure counts and ability updates therefore
@@ -50,6 +58,7 @@ from .models import (
     BankItemOut,
     HealthOut,
     ItemAnalysisOut,
+    ItemAvailabilityUpdate,
     ItemBankOut,
     ItemDetailOut,
     ItemImportErrorOut,
@@ -73,9 +82,10 @@ app = FastAPI(
     description=(
         "基于 2PL IRT 模型的计算机自适应测验（CAT）："
         "单次 Newton 更新估计能力，信息量最大选题，全局曝光上限控制；"
-        "活动会话支持暂停（冻结剩余时限）与恢复（按剩余秒数重算 UTC 截止时间）。"
+        "活动会话支持暂停（冻结剩余时限）与恢复（按剩余秒数重算 UTC 截止时间）；"
+        "题目可撤回/启用，撤回题不再参与新取题。"
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -271,6 +281,7 @@ def serialize_bank_item(row: sqlite3.Row) -> BankItemOut:
         stem=row["stem"],
         answer=row["answer"],
         exposure_count=row["exposure_count"],
+        is_active=bool(row["is_active"]),
     )
 
 
@@ -440,6 +451,50 @@ def get_item(
     return ItemDetailOut(**base)
 
 
+# -------------------------------------------------------------------------
+# Item availability (withdraw / re-enable)
+# -------------------------------------------------------------------------
+
+@app.patch(
+    "/api/items/{item_id}/availability",
+    response_model=BankItemOut,
+    tags=["items"],
+    summary="撤回 / 启用题目（撤回题不再参与新取题）",
+)
+def set_item_availability(
+    item_id: str,
+    body: ItemAvailabilityUpdate,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> BankItemOut:
+    """Withdraw or re-enable one item; unknown ids get a 404.
+
+    ``{"is_active": false}`` withdraws the item: it stops being eligible
+    for new selections, while every stored response, counted exposure and
+    session history is kept.  A session whose *pending* item was withdrawn
+    clears the pending marker and re-selects by the normal rules inside
+    the next ``/next`` transaction (the exposure already counted for the
+    withdrawn item is **not** rolled back), and a *new* answer for the
+    withdrawn item is rejected with 409 — a replayed ``response_id`` is
+    still served from the idempotency store.  ``{"is_active": true}``
+    re-enables the item.  The toggle itself is idempotent: setting the
+    same state again simply returns the current row.
+    """
+    with transaction(conn):
+        row = conn.execute(
+            "SELECT * FROM items WHERE id = ?", (item_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="item not found")
+        conn.execute(
+            "UPDATE items SET is_active = ? WHERE id = ?",
+            (1 if body.is_active else 0, item_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM items WHERE id = ?", (item_id,)
+        ).fetchone()
+    return serialize_bank_item(row)
+
+
 @app.get(
     "/api/items/{item_id}/analysis",
     response_model=ItemAnalysisOut,
@@ -494,6 +549,9 @@ ON CONFLICT(id) DO UPDATE SET
     answer         = excluded.answer
     -- exposure_count is intentionally NOT updated: a re-import must never
     -- reset the global exposure accounting of an already-served item.
+    -- is_active is intentionally NOT updated either: re-importing an
+    -- existing item keeps its withdrawn/enabled state, while a brand-new
+    -- row takes the column DEFAULT (1 = enabled).
 """
 
 
@@ -571,7 +629,7 @@ def _import_payload(
     "/api/items/import",
     response_model=ItemImportResponse,
     tags=["items"],
-    summary="题库批量导入 / 预检（逐行错误、事务原子 upsert、更新保留曝光数）",
+    summary="题库批量导入 / 预检（逐行错误、事务原子 upsert、更新保留曝光数与启用状态）",
 )
 def import_items(
     body: ItemImportRequest, conn: sqlite3.Connection = Depends(get_db)
@@ -602,10 +660,12 @@ def import_items(
     (``BEGIN IMMEDIATE``) transaction via upsert: unknown ids are inserted
     and existing ids are updated in place.  An update overwrites
     difficulty/discrimination/content_tag/stem/options/answer but
-    **preserves ``exposure_count``**, so re-importing a bank never resets
-    global exposure accounting.  If any row fails validation nothing is
-    written at all and the response is HTTP 422 (``valid=false``,
-    counts zero); a database-level failure rolls the whole batch back.
+    **preserves ``exposure_count`` and ``is_active``**, so re-importing a
+    bank never resets global exposure accounting and never re-enables a
+    withdrawn item (a brand-new row starts enabled).  If any row fails
+    validation nothing is written at all and the response is HTTP 422
+    (``valid=false``, counts zero); a database-level failure rolls the
+    whole batch back.
 
     ``results`` and ``errors`` are both ordered by the stable row number, so
     callers can splice them back into their original spreadsheet lines.
@@ -968,10 +1028,18 @@ def next_item(
 ) -> NextItemOut:
     """Select the next item.
 
-    Eligibility: ``exposure_count < exposure_limit`` and the item has not
-    already been answered in this session.  Selection: highest Fisher
-    information at the current theta; ties break on the smallest item id, so
-    the result is fully deterministic.
+    Eligibility: the item is enabled (``is_active = 1``),
+    ``exposure_count < exposure_limit`` and the item has not already been
+    answered in this session.  Selection: highest Fisher information at the
+    current theta; ties break on the smallest item id, so the result is
+    fully deterministic.
+
+    A pending item that was withdrawn after being served is cleared inside
+    this same transaction and a replacement is selected by the normal
+    rules; the exposure counted when it was originally selected is not
+    rolled back.  (If no eligible replacement exists the session finishes
+    with the usual ``no_available_items`` /
+    ``tag_minimums_unfulfillable`` reason.)
 
     When the session carries ``tag_minimums``, the per-tag deficit is
     computed from stored responses.  If the number of remaining answer slots
@@ -1029,19 +1097,41 @@ def next_item(
         se = session_standard_error(conn, session_id, session["theta"])
         now = utc_now()
 
-        # Case 1: a served, unanswered item is pending -> return it as-is.
+        # Resolve the pending item first.  A pending item that has been
+        # withdrawn since it was served can no longer be answered: clear the
+        # pending marker here, inside the same serialised transaction, and
+        # fall through to the normal selection rules below.  The exposure
+        # counted when the item was selected is NOT rolled back.
+        pending_row: sqlite3.Row | None = None
+        withdrawn_pending: str | None = None
         if session["current_item_id"]:
-            item_row = conn.execute(
+            candidate_pending = conn.execute(
                 "SELECT * FROM items WHERE id = ?", (session["current_item_id"],)
             ).fetchone()
+            if candidate_pending is not None and candidate_pending["is_active"]:
+                pending_row = candidate_pending
+            else:
+                # Withdrawn (or, defensively, no longer existing) pending
+                # item: drop the marker and re-select below.
+                withdrawn_pending = session["current_item_id"]
+                conn.execute(
+                    """UPDATE sessions
+                       SET current_item_id = NULL, updated_at = ?
+                       WHERE id = ?""",
+                    (now, session_id),
+                )
+
+        # Case 1: a served, unanswered (and still enabled) item is pending
+        # -> return it as-is.
+        if pending_row is not None:
             outcome = {
                 "status": session["status"],
-                "item_row": item_row,
+                "item_row": pending_row,
                 "information": irt.information(
                     session["theta"],
-                    item_row["discrimination"],
-                    item_row["difficulty"],
-                ) if item_row is not None else None,
+                    pending_row["discrimination"],
+                    pending_row["difficulty"],
+                ),
                 "exposure_limit": session["exposure_limit"],
                 "answered_count": n_answered,
                 "max_items": session["max_items"],
@@ -1093,11 +1183,13 @@ def next_item(
 
         else:
             # Candidate read under the write lock: exposure counts seen here
-            # cannot change before we update them.
+            # cannot change before we update them.  Withdrawn items
+            # (is_active = 0) never take part in new selections.
             candidates = conn.execute(
                 """
                 SELECT * FROM items
-                WHERE exposure_count < ?
+                WHERE is_active = 1
+                  AND exposure_count < ?
                   AND id NOT IN (
                       SELECT item_id FROM responses WHERE session_id = ?
                   )
@@ -1246,6 +1338,20 @@ def next_item(
                         "note": None,
                     }
 
+    if withdrawn_pending is not None:
+        # The pending item was withdrawn: it was cleared and (when possible)
+        # replaced inside the transaction above.  Surface that in the note;
+        # the exposure counted at its original selection stays as-is.
+        cleared_note = (
+            f"原挂起题 {withdrawn_pending} 已撤回：已在同一事务内清除挂起项"
+            "并按既有选题规则重选（该题已计曝光不回退）"
+        )
+        outcome["note"] = (
+            f"{outcome['note']}；{cleared_note}"
+            if outcome["note"]
+            else cleared_note
+        )
+
     item_row = outcome["item_row"]
     return NextItemOut(
         session_id=session_id,
@@ -1294,7 +1400,10 @@ def submit_response(
     first committed record and is replayed (HTTP 200) instead of being
     scored a second time.  A paused session rejects *new* answers with 409
     (the pending item is preserved), but a replayed ``response_id`` is still
-    served by the idempotency lookup above.
+    served by the idempotency lookup above.  A *new* answer for a withdrawn
+    item (``is_active = 0``) is likewise rejected with 409 — no response
+    row is written and theta is not updated — while a replayed
+    ``response_id`` still returns the first stored result.
 
     After the theta update the optional precision stop is evaluated in the
     same transaction: when the session has a ``target_se``, the summed 2PL
@@ -1358,6 +1467,19 @@ def submit_response(
             ).fetchone()
             if item is None:
                 raise HTTPException(status_code=404, detail="item not found")
+            if not item["is_active"]:
+                # A withdrawn item accepts no new answers: no response row is
+                # written and theta is left untouched.  A replayed
+                # response_id took the idempotency branch above and is still
+                # served; the pending marker is cleared by the next /next.
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"题目 {body.item_id} 已撤回，不再接受新的作答；"
+                        "请调用 "
+                        f"POST /api/sessions/{session_id}/next 重新选题"
+                    ),
+                )
 
             option_keys = {opt["key"] for opt in parse_options(item["options"])}
             if response_key not in option_keys:
